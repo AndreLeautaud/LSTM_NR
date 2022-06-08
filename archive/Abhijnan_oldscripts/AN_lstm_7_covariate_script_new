@@ -1,0 +1,382 @@
+7 covariate script 
+
+M=readtable('gap_filled_rawtrainset_6and7covfertappanddayssince.csv'); %load this csv file(around 6 mb) into latlab drive and import it from there into the variable M
+s = rng(1);
+rawtab = M; 
+size(rawtab)
+site = string(rawtab.SiteID(2:end));
+treatment = string(rawtab.Treatment(2:end));
+
+sites = site;
+for i = 1:length(site)
+    sites(i) = categorical([string(site(i))+'_~_'+string(treatment(i))]);
+end
+
+sites = unique(sites)
+
+%% parse out rain, n2o, and co2 time series data from each treatment
+raincell = cell(length(sites),1);
+n2ocell = cell(length(sites),1);
+%co2cell = cell(length(sites),1);
+maxlength = -inf;
+
+soilMcell = cell(length(sites),1); %we have to include both soil temp and soil inorganic nitrogen
+%NO3 = cell(length(sites),1);
+fert = cell(length(sites),1);
+dayssinceapp = cell(length(sites),1);
+wfpscell = cell(length(sites),1);
+%datecell = cell(length(sites),1);
+%sitecell = cell(length(sites),1);
+%treatmentcell = cell(length(sites),1);
+
+
+
+% CD - want to iterate through this next time around. 
+    % 1 - remove CO2 (will want to try this both ways, not guaranteed that
+    % we will have CO2 available for use, so want a NN without CO2. CO2 is
+    % a valuable variable though, so want a scenario if CO2 was measured)
+    % 2 - go through scenarios looking at other covariates (NH4, NO3, WFPS,
+    % soilM, soiltemp5, tavg) - these are fairly common variables
+    % (especially soilM/WFPS and temperatures) - what is the best NN that
+    % can be developed using rainirrigation,soil moisture/temperature
+    
+for i = 1:length(sites)
+    sitename = sites(i);
+    sitename = strsplit(sitename,'_~_');
+    treatment = sitename(2);
+    sitename = sitename(1);
+    
+    %data = rawtab((rawtab.Site == sitename) & (rawtab.Treatment == treatment),:);
+    data = rawtab((rawtab.SiteID == sitename) & (rawtab.Treatment == treatment),:);
+    
+    % we have NaN values for all covariates in a lot of these datasets
+    % after a certain point. Were drawn out to 365 days...? 
+    % if NaN across covariates, drop it 
+        % data(all(~isnan(data),2),:); % this doesnt work, also looks
+        % across all columns, only want to look at covariates being used in NN columns 
+    
+    if size(data,1) > maxlength
+        maxlength = size(data,1);
+    end
+    
+    %n2o
+    n2ocell{i} = data.n2o;
+    
+    % use rainirrigation where rain is not available (and vice versa)
+    rain = data.rain;
+    irrigation = data.rainirrigation
+    k = rain;   % nan*ones(size(rain)); - what was this doing, just creating a NaN array? seemed to introduce NaN values... 
+    k(isnan(irrigation)) = rain(isnan(irrigation));
+    k(isnan(rain)) = irrigation(isnan(rain));
+    raincell{i} = k;
+    soilMcell{i} = data.soiltemp10;
+    %NO3{i} = data.NO3;
+    dayssinceapp{i} = data.DaysSinceApp
+    fert{i} = data.Fertilizerapplied;
+    %co2
+    %co2cell{i} = data.CO2;
+    
+    % wfps/soilM 
+    wfpscell{i} = data.WFPS;
+
+    %datecell{i} = datestr(data.Date)
+    %sitecell{i} = data.SiteID
+    %treatmentcell{i} = data.Treatment
+
+    
+end
+
+n2o = [];
+rain = [];
+%co2 = [];
+wfps = []; 
+soil10 = [];
+%soilno3 = [];
+fertdayssinceapp=[];
+fertapp = [];
+%site = []
+%treatment = []
+%date = []
+for i = 1:length(n2ocell)
+    
+    n2odat = n2ocell{i};
+    raindat = raincell{i};
+    %co2dat = co2cell{i};
+    wfpsdat = wfpscell{i}; 
+    soil10dat = soilMcell{i};
+    %soilno3dat = NO3{i}
+    dayssincedat = dayssinceapp{i}
+    fertappdat = fert{i}
+    %sitedat = string(sitecell{i})
+    %treatmentdat = string(treatmentcell{i})
+    %datedat = (datecell{i})
+    
+    if length(n2odat) <  maxlength
+        n2odat = [n2odat;nan*ones(maxlength-length(n2odat),1)];
+        raindat = [raindat;nan*ones(maxlength-length(raindat),1)];
+        %co2dat = [co2dat;nan*ones(maxlength-length(co2dat),1)];
+        wfpsdat = [wfpsdat;nan*ones(maxlength-length(wfpsdat),1)];
+        soil10dat =  [soil10dat;nan*ones(maxlength-length(soil10dat),1)];
+        %soilno3dat =  [soilno3dat;nan*ones(maxlength-length(soilno3dat),1)];
+        dayssincedat =  [dayssincedat;nan*ones(maxlength-length(dayssincedat),1)];
+        fertappdat =  [fertappdat;nan*ones(maxlength-length(fertappdat),1)];
+        %sitedat =  [sitedat;nan*ones(maxlength-length(sitedat),1)];
+        %treatmentdat =  [treatmentdat;nan*ones(maxlength-length(treatmentdat),1)];
+        
+        %datedat =  [datedat;nan*ones(maxlength-length(datedat),1)];
+    end
+    n2o = [n2o,n2odat];
+    rain = [rain,raindat];
+    %co2 = [co2,co2dat];
+    wfps = [wfps,wfpsdat];
+    soil10 = [soil10,soil10dat];
+    %soilno3 = [soilno3,soilno3dat];
+    fertdayssinceapp = [fertdayssinceapp,dayssincedat];
+    fertapp = [fertapp,fertappdat];
+    %site = [site,sitedat];
+    %treatment = [treatment,treatmentdat];
+    %date = [date, datedat];
+end
+
+n2o = n2o';     % ' means transpose? 
+rain = rain';
+%co2 = co2';
+wfps = wfps';
+soil10 = soil10';
+%soilno3 = soilno3';
+fertdayssinceapp = fertdayssinceapp';
+fertapp = fertapp';
+%site = site';
+%treatment = treatment';
+%date= date';
+
+
+
+% fill internal gaps in n2o (I do this right now because otherwise there is
+% insufficient continuous data to train with using both rain and co2)
+
+% CD - need to think on this more, this may be problematic within our
+% Gapfilling idea... 
+for i = 1:size(n2o,1)
+    a = n2o(i,:);
+    b = 0.5 * (fillmissing(a, 'previous') + fillmissing(a, 'next'));
+    n2o(i,:) = b;
+end
+
+for i = 1:size(rain,1)
+    a = rain(i,:);
+    b = 0.5 * (fillmissing(a, 'previous') + fillmissing(a, 'next'));
+    rain(i,:) = b;
+end
+
+%for i = 1:size(co2,1)
+%    a = co2(i,:);
+%    b = 0.5 * (fillmissing(a, 'previous') + fillmissing(a, 'next'));
+%    co2(i,:) = b;
+%end
+
+for i = 1:size(wfps,1)
+    a = wfps(i,:);
+    b = 0.5 * (fillmissing(a, 'previous') + fillmissing(a, 'next'));
+    wfps(i,:) = b;
+end
+
+for i = 1:size(fertapp,1)
+    a = fertapp(i,:);
+    b = 0.5 * (fillmissing(a, 'previous') + fillmissing(a, 'next'));
+    fertapp(i,:) = b;
+end
+
+for i = 1:size(fertdayssinceapp,1)
+    a = fertdayssinceapp(i,:);
+    b = 0.5 * (fillmissing(a, 'previous') + fillmissing(a, 'next'));
+    fertdayssinceapp(i,:) = b;
+end
+for i = 1:size(soil10,1)
+    a = soil10(i,:);
+    b = 0.5 * (fillmissing(a, 'previous') + fillmissing(a, 'next'));
+    soil10(i,:) = b;
+end
+
+%% split on nan to form continuous segments for training set
+c = cell(0);
+
+for i = 1:size(n2o,1)
+    seq = [];
+    for j = 1:size(n2o,2)
+        n2oval = n2o(i,j);
+        rainval = rain(i,j); %rain or rainirrigation 
+        %co2val = co2(i,j);
+        wfpsval = wfps(i,j);
+        soilval = soil10(i,j);
+        %soilno3val = soilno3(i,j);
+        dayssinceval = fertdayssinceapp(i,j);
+        fertval = fertapp(i,j);
+
+        %siteval = site(i,j);
+        %treatmentval = treatment(i,j);
+        %dateval = date(i,j);
+
+
+        split = isnan(n2oval)||isnan(rainval)||isnan(soilval)||isnan(dayssinceval)||isnan(fertval)||isnan(wfpsval); % split anywhere we have nan n2o, nan co2, or nan rain
+        if ~split
+            seq = [seq,[n2oval;rainval;fertval;wfpsval;dayssinceval;soilval]];
+        end
+        if split&&(length(seq)>0)
+            c = [c;seq];
+            seq = [];
+        end            
+    end
+end
+    
+seqlengths = zeros(length(c),1);
+hasnan = zeros(length(c),1);;
+
+for i = 1:length(c)
+    seqlengths(i) = length(c{i});
+    hasnan(i) = sum(isnan(c{i}(:)));
+end
+
+k = 30;
+%k=15;  %target sequence length
+    % increasing k from 5 to 15, but will still provide n2o every 5 days.
+    % So n2o on days 1,6,11 over the 15 days instead of looking at just day
+    % 1 in a 5 day span 
+    
+% sampdays = 3; % number of days that actual n2o value is given to net as input (woops, not actually used in this version)
+  
+aug = 5; %augmentation factor (expand data by randomy window shifting by approximately this much)
+    % still need to see what this is doing in practice more.. 
+d = cell(0);
+
+% CK - here I am only keeping sequences shorter than k
+for i = 1:length(c)
+    seq = c{i};
+    if length(seq)>=k
+        d = [d;seq];
+    end
+end
+
+% CK - here I am randomly shuffling the sequences of length >= k
+d = d(randperm(length(d),length(d)));
+
+trainfrac = 0.7; %approximate fraction of data to be used for training
+splitidx = floor(length(d)*trainfrac);
+
+% CK - here I split off a separate array, dvalidation, for validation
+% d will be used for training
+dvalidation = d(splitidx+1:end);    % = 4 cell arrays, 30%
+d(splitidx+1:end) = [];             % = 9 cell arrays, 70%
+
+%% augment and make training set
+XTrain1= cell(0);
+YTrain1 = cell(0);
+
+rng(s); % initialize rng for consistency 
+for i = 1:length(d) % for every entry of d
+    count = 0; % start counter at zero
+    seq = d{i}; % use the ith entry of d to draw a subsequence from
+    
+    % k is sequence length 
+    while count < (length(seq)/k*aug) % this condition is met when we have enough subsequences to satisfy aug
+        idx = randi([1,length(seq)-k+1],1); % pick a random starting index within seq
+        idx = idx:(idx+k-1); % augment this idx to an interval of indicies of length k
+        
+        splitseq = seq(:,idx); % slice out the portion of seq corresponding to the indices in idx
+        
+        % sparsify n2o data % 
+        sampidxn2o = zeros(1,k);
+        % sampidxn2o = zeros(1,k); % creates vector - 1 * k vector of zeros. this artificially sparsifies our continuous n2o input
+        
+        % 1 - n2o data is used. 0 - n2o data not used
+            % sampidxn2o(1:sampdays) = 1; % lets first sampdays to be used 
+            % sampidxn2o(1:3:k) = 1; % would use 1,4,7 up till k
+        sampidxn2o(1:5:k) = 1; 
+        
+        % only want to use real/measured n2o values 
+        % (not simple gap-filled values)
+            % so, if the n2o value is NaN, need to choose another day for
+            % n2o in that sampidxn2o...
+        
+        
+        %co2seq = seq(2,idx); % grab the co2 for this subsequence
+        rainseq = seq(2,idx); % grab the rain for this subsequence
+        soil10seq = seq(6,idx); % grab the soil10 for this subsequence
+        %soilno3seq = seq(4,idx); % grab the soil10 for this subsequence
+        wfpsseq = seq(4,idx); % grab the wfps for this subsequence
+        fertseq = seq(3,idx);
+
+        daysinceappseq = seq(5,idx);
+        
+         
+        
+        %sampidxrain = ~isnan(co2seq); % compute when (for this subsequence) measurements were present -- unused here
+        
+        %co2seq(isnan(co2seq)) = 0; % set nan values in c02 to zero (could also do a sampidx type thing for this, but don't right now)
+        % wfpsseq(isnan(wfpsseq)) = 0;
+        
+        % turned off before 6/19 run. Should be handled above
+            % wfpsseq = fillmissing(wfpsseq,'linear'); 
+        
+        XTrain1 = [XTrain1;[splitseq(1,:).*sampidxn2o;rainseq;fertseq;wfpsseq;daysinceappseq;soil10seq;~sampidxn2o]]; % given first n2o point, co2, rain, and a list of where n2o is not sampled
+        YTrain1 = [YTrain1;splitseq(1,:)]; % we want the network to predict continuous n2o
+        count = count + 1;
+    end
+end
+
+
+%% make validation set
+XValidation1 = cell(0);
+YValidation1 = cell(0);
+
+rng(s);
+for i = 1:length(dvalidation)
+    count = 0;
+    seq = dvalidation{i};
+    while count < (length(seq)/k*aug)
+        idx = randi([1,length(seq)-k+1],1);
+        idx = idx:(idx+k-1);
+        
+        splitseq = seq(:,idx);
+        sampidxn2o = zeros(1,k);
+        sampidxn2o(1:5:k) = 1;
+        
+        %co2seq = seq(2,idx);
+        rainseq = seq(2,idx);
+        %soilno3seq = seq(3,idx); % grab the soil10 for this subsequence
+        wfpsseq = seq(4,idx);
+        soil10seq = seq(6,idx);
+        fertseq = seq(3,idx);
+
+        daysinceappseq = seq(5,idx);
+        
+        %sampidxrain = ~isnan(co2seq);
+        %co2seq(isnan(co2seq)) = 0;
+        %rainseq(isnan(rainseq)) = 0;
+        % wfpsseq(isnan(wfpsseq)) = 0;
+        %wfpsseq = fillmissing(wfpsseq,'linear');
+        %soilno3seq = fillmissing(soilno3seq,'linear');
+         
+        
+        XValidation1 = [XValidation1;[splitseq(1,:).*sampidxn2o;rainseq;fertseq;wfpsseq;daysinceappseq;soil10seq;~sampidxn2o]];
+        YValidation1 = [YValidation1;splitseq(1,:)];
+        count = count + 1;
+    end
+end
+
+data = XValidation1;
+
+
+%% machine learning (LSTM) - this is where training happens, will take some time to finish (~20-30 minutes) 
+%normalize input data (VERY IMPORTANT)
+mu = mean([XTrain1{:}],2);
+sig = std([XTrain1{:}],0,2);
+
+for i = 1:numel(XTrain1)
+    XTrain1{i} = (XTrain1{i} - mu) ./ sig;
+end
+
+for i = 1:numel(XValidation1)
+    XValidation1{i} = (XValidation1{i} - mu) ./ sig;
+end
+

@@ -1,0 +1,1313 @@
+---
+title: "LSTM Initial data set exploration"
+date: "June 3, 2022"
+author: "Chris Dorich"
+output: 
+  html_document:
+    toc: true 
+    toc_float: 
+      collapsed: false
+      smooth_scroll: false
+latex_engine: xelatex
+header-includes:
+- \usepackage{fontspec}
+- \setmainfont{Georgia}
+fig.width: 20
+fig.height: 12
+---    
+  
+Chris Dorich (chris.dorich@colostate.edu)     
+June 3, 2022   
+  \   
+
+# Data upload & management                  
+```{r, echo=F, warning=F, message=F }
+
+library(tidyverse)
+library(plotly)
+library(dygraphs)
+library(xts)
+library(DT)
+
+library(lubridate)
+
+library(corrplot)
+library(imputeTS)
+
+library(fitdistrplus)
+
+# library(moments) # skewness 
+library(e1071) # kurtosis # http://www.r-tutor.com/elementary-statistics/numerical-measures/kurtosis
+
+
+library(caret)
+
+library(rfPermute)
+
+library(quantmod)
+
+library(gridExtra)
+
+# df <- read.csv("N:/Research/conant/chris/Dorich_n2o/Cam_AI/Dailydata_30day.csv", stringsAsFactors = F )
+# hout <- read.csv("N:/Research/conant/chris/Dorich_n2o/Cam_AI/Dailydata_HOLDOUT_30day.csv", stringsAsFactors = F )
+
+# df <- read.csv("N:/Research/conant/chris/Dorich_n2o/Cam_AI/DailyGHG1.csv", stringsAsFactors = F )
+ # df <- read.csv("N:/Research/conant/chris/Dorich_n2o/Cam_AI/DailyGHG.NN.crop.csv", stringsAsFactors = F ) # realized errors on 7/6/21, updating to 
+
+# CD - 6/3/22 this is what was being loaded, but more missing values in fert.type, and likely other things. 
+  # 558438 rows of data, 79,341 in DailyGHG.NN.May.csv 
+df <- read.csv("N:/Research/conant/chris/Dorich_n2o/Cam_AI/DailyGHG_V2.csv", stringsAsFactors = F )
+
+# df <- read.csv("N:/Research/conant/chris/Dorich_n2o/Cam_AI/DailyGHG.NN.May.csv", stringsAsFactors = F )
+
+
+# df$Date <- as.Date(df$Date, format = '%m/%d/%Y' )
+df$Date <- as.Date(df$Date, format = '%Y-%m-%d' )
+ 
+df$rain.irrigation <- ifelse(is.na(df$rain.irrigation)==T, df$rain, df$rain.irrigation ) 
+
+# unique(df[,c('SiteID','Treatment')])
+
+# unique(hout[,c('SiteID','Treatment')])
+
+df$year <- year(df$Date)
+
+
+# corrections 
+  df$soil.temp5 <- ifelse(df$soil.temp5 < -50, NA, df$soil.temp5 )
+ df$Fert.Type <- ifelse(df$Fert.Type == "", NA, df$Fert.Type )
+ df$Fert.Type <- ifelse(df$Fert.Type == 'Urea+manure','manure+urea',df$Fert.Type)
+ df$tavg <- ifelse(df$tavg > 120, NA, df$tavg)
+  df$tmin <- ifelse(df$tmin > 120, NA, df$tavg)
+  
+ df$Fert.Type <- tolower(df$Fert.Type) 
+   
+ # put wfps.calc in for WFPS if it doesn't exist 
+ df$WFPS <- ifelse(is.na(df$WFPS)==T, df$wfps.calc , df$WFPS )
+ 
+ df$Fert.Type <- ifelse(df$Fert.Type == 'anhyrous ammonia, monoammonium phosphate',
+                        'anhydrous ammonia, monoammonium phosphate',df$Fert.Type)
+ 
+ # need to exclude some data 
+  # e.g., deantoni-conv has 366 rows of data, but the last 54 rows are all NA (we extended them to 365 days at one point, though with all NA data, we shouldn't have that in here.)
+ 
+ 
+ # trim the dataset 
+  # no leading or trailing NA n2o days
+    # only trimming trailing for now (in case leading has fert/till info of interest)
+ df <- df %>% 
+    dplyr::group_by(SiteID, Treatment) %>% 
+    filter(Date <= Date[max(which(!is.na(n2o)))]  )
+           # &        Date >= Date[min(which(!is.na(n2o)))] 
+           # ) 
+  # trim leading added later (after dayssincefert is added)
+  
+ summary(df)
+ 
+```         
+Likely issues that need to be corrected in the dataset:         
+  * fill in more soil texture and BD values        
+  * rain and rain.irrigation NAs            
+  * -100.00 soil.temp5 is not possible, must be an error in recording. Need to filter this out.         
+  * check WFPS values. Is 0.32 actually 0.32, or is it 32?       
+  * WFPS seems to be missing more often than I would have thought...  researchers are using handheld soil moisture probe instead of monitoring constantly. This presents more uncertainty as the model will have to be training on more gap-filling WFPS data than originally thought.               
+  \          
+  \              
+           
+  
+Adding tillage and fertilization metrics.              
+  *  Days since last till/fert event.        
+```{r, echo=F, warning=F, message=F }
+
+dfall <- data.frame()
+
+for(i in unique(df$Treatment) ){
+  
+  Site.data2 <- subset(df, df$Treatment == i)
+  
+# days since fert 
+ # fert event separation
+    Site.data2$fertevent <- Site.data2$Fertilizer.kgN.ha
+    Site.data2$fertevent <- ifelse(Site.data2$fertevent==0,NA, Site.data2$fertevent)
+    
+    UniqEvents <- unique(subset(Site.data2, is.na(Site.data2$fertevent)==F)[,c('Date','fertevent')] )
+    
+    # check if there are fert events 
+    if(nrow(UniqEvents)==0){ 
+      
+      Site.data2$DaysSinceApp <- NA 
+      Site.data2$n2ocum <- NA 
+      Site.data2$EventNumber <- NA 
+        Site.data2$fertevent <- NULL
+        
+    } else {
+    
+    UniqEvents$EventNumber <- seq(1:nrow(UniqEvents))
+    names(UniqEvents)[2] <- 'Fertilizer.kgN.ha'
+    
+    
+    # apply fert event # 
+    Site.data2$fertevent <- NULL
+    Site.data2 <- merge(Site.data2, UniqEvents, by=c('Date','Fertilizer.kgN.ha'), all.x=T, all.y=F )
+    
+      # Site.data2$fertMagnitude <- Site.data2$EventNumber * Site.data2$Fertilizer.kgN.ha
+    
+    Site.data2$EventNumber = zoo::na.locf0(Site.data2$EventNumber )
+    Site.data2$EventNumber <- paste('fert_',Site.data2$EventNumber,sep='')
+    
+    # normalize time frame 
+    Site.data2 <- Site.data2 %>%
+      group_by(EventNumber) %>%
+      dplyr::mutate(DaysSinceApp = row_number(), 
+                    n2ocum = cumsum(n2o) )
+    
+    # unknown amount of time since last fertilizer event (before data started being collected)
+    Site.data2$DaysSinceApp <- ifelse(Site.data2$EventNumber == 'fert_NA', NA, Site.data2$DaysSinceApp )
+    
+    } # end of fert event loop
+    
+    if(i=="no.om.no.urea"){
+      dfall <- data.frame( Site.data2 )
+    } else { 
+      dfall <- rbind(data.frame(dfall),data.frame(Site.data2))
+    }
+ 
+       
+}
+df <- dfall 
+rm(dfall)
+
+## days since tillage  #####################
+dfall <- data.frame()
+
+for(i in unique(df$Treatment) ){
+  
+  Site.data2 <- subset(df, df$Treatment == i)
+  
+# days since fert 
+ # fert event separation
+    Site.data2$tillevent <- Site.data2$Tillage.cm
+    Site.data2$tillevent <- ifelse(Site.data2$tillevent==0,NA, Site.data2$tillevent)
+    
+    UniqEvents <- unique(subset(Site.data2, is.na(Site.data2$tillevent)==F)[,c('Date','tillevent')] )
+    
+    # check if there are fert events 
+    if(nrow(UniqEvents)==0){ 
+      
+      Site.data2$DaysSinceTill <- NA 
+      Site.data2$n2ocumT <- NA 
+      Site.data2$TillEventNumber <- NA 
+        Site.data2$tillevent <- NULL
+        
+    } else {
+    
+    UniqEvents$TillEventNumber <- seq(1:nrow(UniqEvents))
+    names(UniqEvents)[2] <- 'Tillage.cm'
+    
+    
+    # apply till event # 
+    Site.data2$tillevent <- NULL
+    Site.data2 <- merge(Site.data2, UniqEvents, by=c('Date','Tillage.cm'), all.x=T, all.y=F )
+    
+      # Site.data2$fertMagnitude <- Site.data2$EventNumber * Site.data2$Fertilizer.kgN.ha
+    
+    Site.data2$TillEventNumber = zoo::na.locf0(Site.data2$TillEventNumber )
+    Site.data2$TillEventNumber <- paste('till_',Site.data2$TillEventNumber,sep='')
+    
+    # normalize time frame 
+    Site.data2 <- Site.data2 %>%
+      group_by(TillEventNumber) %>%
+      dplyr::mutate(DaysSinceTill = row_number(), 
+                    n2ocumT = cumsum(n2o) )
+    
+     # unknown amount of time since last till event (before data started being collected)
+    Site.data2$DaysSinceTill <- ifelse(Site.data2$TillEventNumber == 'till_NA', NA, Site.data2$DaysSinceTill )
+    
+    
+    } # end of fert event loop
+    
+    if(i=="no.om.no.urea"){
+      dfall <- data.frame( Site.data2 )
+    } else { 
+      dfall <- rbind(data.frame(dfall),data.frame(Site.data2))
+    }
+ 
+       
+}
+      
+  # fert decay rates #  
+
+df <- dfall 
+rm(dfall)
+
+df <- tidyr::unite(df,"id_loc",Treatment,EventNumber,remove = F)
+
+# now trim leading info that has no n2o 
+ df <- df %>% 
+    dplyr::group_by(SiteID, Treatment) %>% 
+    filter(Date >= Date[min(which(!is.na(n2o)))]  )
+           # &        
+           # ) 
+ 
+```      
+  \   
+
+
+Excluded site-treatments with missing soil moisture or <40% of days with WFPS measurements:                  
+```{r, echo=F, warning=F, message=F }
+
+missingVariableCompletely <- df %>% 
+    dplyr::group_by(SiteID,Treatment) %>% 
+    dplyr::add_tally() %>%
+    dplyr::summarise(missingWFPS = sum(is.na(WFPS)),
+                     missingST5 = sum(is.na(soil.temp5)),
+                     missingST10 = sum(is.na(soil.temp10)),
+                     missingSand = sum(is.na(Sand)),
+                     #missing.wfps.calc = sum(is.na(wfps.calc)), 
+                     n = max(n)  )
+
+missingVariableCompletely$percentWFPSdata <- (1 - (missingVariableCompletely$missingWFPS/missingVariableCompletely$n) ) * 100
+missingVariableCompletely$percentSTdata <- (1 - (missingVariableCompletely$missingST10/missingVariableCompletely$n) ) * 100
+missingVariableCompletely$percentST5data <- (1 - (missingVariableCompletely$missingST5/missingVariableCompletely$n) ) * 100
+
+# data.frame( subset(missingVariableCompletely, missingVariableCompletely$missingWFPS == missingVariableCompletely$n) )
+  # data.frame( subset(missingVariableCompletely, missingVariableCompletely$percentSTdata < 40 ) ) 
+
+
+
+  # data.frame( subset(missingVariableCompletely, missingVariableCompletely$percentWFPSdata < 40 ) ) 
+
+
+```                           
+  * WFPS needs more gap-filling than originally thought.            
+  * Will have to exclude these sites from the NN for now I think.        
+  \
+
+# Gap-filling/interpolation of covariates          
+
+Basic linear interpolation for covariates.                    
+```{r, echo=F, warning=F, message=F }
+
+df$wfps.real <- ifelse(is.na(df$WFPS)==T, 0, 1)
+df$NH4.real <- ifelse(is.na(df$NH4)==T, 0, 1)
+df$NO3.real <- ifelse(is.na(df$NO3)==T, 0, 1)
+df$tavg.real <- ifelse(is.na(df$tavg)==T, 0, 1)
+df$soil.temp5.real <- ifelse(is.na(df$soil.temp5)==T, 0, 1)
+df$soil.temp10.real <- ifelse(is.na(df$soil.temp10)==T, 0, 1)
+
+df$n2o.real <- ifelse(is.na(df$n2o)==T, 0, 1)
+
+# place holders for now 
+  # will put in a non-linear gap-filled value for NO3/NH4 here... 
+df$NH4other <- df$NH4
+df$NO3other <- df$NO3
+
+df2 <- data.frame( df %>%
+  group_by(SiteID,Treatment) %>%
+  mutate(NH4 = na.approx(NH4, na.rm=F),
+         NO3 = na.approx(NO3, na.rm=F), 
+         tavg = na.approx(tavg, na.rm=F),
+         soil.temp5 = na.approx(soil.temp5, na.rm=F),
+         soil.temp10 = na.approx(soil.temp10, na.rm=F),
+         WFPS = na.approx(WFPS, na.rm=F) )  )
+
+```      
+  \           
+             
+## Soil inorganic N decay curves              
+
+<span style="color: red;"> 
+</span>
+
+overly simplistic NO3/NH4 decay model...          
+  * what about the crop needs/existence       
+  * soil texture        
+  * what else could be worked in.            
+  
+Test case looking at WagnerRiddle data:          
+```{r, echo=F, warning=F, message=F }
+   
+testdf <- subset(df, df$SiteID == 'wagnerriddle')
+
+ggplot(data = subset(testdf, is.na(testdf$NO3)==F),
+         aes(x = Date, y = NO3, color = as.factor(Treatment ) ) ) + # facet_wrap(~Fertilizer.Type) + 
+    geom_point() + geom_line() + theme_bw() + theme(legend.position = "none" ) + 
+  # abline(v=subset(testdf, is.na(testdf$Fertilizer.kgN.ha)==F), color = as.factor(Treatment ) )
+geom_vline(xintercept = subset(testdf, is.na(testdf$Fertilizer.kgN.ha)==F & Treatment=='ct')$Date,lty=2 , color = 'red') + 
+  geom_vline(xintercept = subset(testdf, is.na(testdf$Fertilizer.kgN.ha)==F & Treatment=='nt')$Date,lty=2 , color = 'blue')
+
+ggplot(data = subset(testdf, is.na(testdf$NH4)==F),
+         aes(x = Date, y = NH4, color = as.factor(Treatment ) ) ) + # facet_wrap(~Fertilizer.Type) + 
+    geom_point() + geom_line() + theme_bw() + theme(legend.position = "none" ) + 
+  # abline(v=subset(testdf, is.na(testdf$Fertilizer.kgN.ha)==F), color = as.factor(Treatment ) )
+geom_vline(xintercept = subset(testdf, is.na(testdf$Fertilizer.kgN.ha)==F & Treatment=='ct')$Date,lty=2 , color = 'red') + 
+  geom_vline(xintercept = subset(testdf, is.na(testdf$Fertilizer.kgN.ha)==F & Treatment=='nt')$Date,lty=2 , color = 'blue')
+  
+
+ # no3_decay <- loess(NO3 ~  DaysSinceApp, data = df %>% filter(is.na(NO3)==F) ) # Fertilizer.kgN.ha
+  # predict(no3_decay, data.frame(DaysSinceApp = seq(5, 30, 1)), se = TRUE )
+ 
+# https://stats.stackexchange.com/questions/105985/how-to-interpolate-spline-loess-etc-with-a-mix-of-critical-and-non-critical
+
+```       
+  \          
+ 
+```{r, echo=F, warning=F, message=F }
+ 
+  # subset(testdf, testdf$Date >= "2003-04-01" & Date <= "2003-11-30")
+
+snap1 <- ggplot(data = subset(testdf, is.na(testdf$NO3)==F),
+         aes(x = Date, y = NO3, color = as.factor(Treatment ) ) ) + # facet_wrap(~Fertilizer.Type) + 
+    geom_point() + theme_bw() + theme(legend.position = "top" ) + 
+  scale_x_date(limits = as.Date(c("2003-04-01","2003-11-30"))) + 
+  # xlim(c(as.numeric(as.Date("2003-04-01"), origin="1980-01-01"),as.numeric(as.Date("2003-10-20"), origin="1980-01-01") ) ) + 
+  # abline(v=subset(testdf, is.na(testdf$Fertilizer.kgN.ha)==F), color = as.factor(Treatment ) )
+geom_vline(xintercept = subset(testdf, is.na(testdf$Fertilizer.kgN.ha)==F & Treatment=='ct')$Date,lty=2 , color = 'red') + 
+  geom_vline(xintercept = subset(testdf, is.na(testdf$Fertilizer.kgN.ha)==F & Treatment=='nt')$Date,lty=2 , color = 'blue') + 
+    geom_vline(xintercept = subset(testdf, testdf$Date == "2003-04-30" & Treatment=='nt')$Date,lty=3 , color = 'blue')
+
+  
+  
+ snap1b <- ggplot(data = subset(testdf, is.na(testdf$NO3)==F),
+         aes(x = Date, y = NO3, color = as.factor(Treatment ) ) ) + # facet_wrap(~Fertilizer.Type) + 
+    geom_point() + theme_bw() + theme(legend.position = "top" ) + 
+  scale_x_date(limits = as.Date(c("2003-04-01","2003-11-30"))) + 
+  # xlim(c(as.numeric(as.Date("2003-04-01"), origin="1980-01-01"),as.numeric(as.Date("2003-10-20"), origin="1980-01-01") ) ) + 
+  # abline(v=subset(testdf, is.na(testdf$Fertilizer.kgN.ha)==F), color = as.factor(Treatment ) )
+geom_vline(xintercept = subset(testdf, is.na(testdf$Fertilizer.kgN.ha)==F & Treatment=='ct')$Date,lty=2 , color = 'red') + 
+  geom_vline(xintercept = subset(testdf, is.na(testdf$Fertilizer.kgN.ha)==F & Treatment=='nt')$Date,lty=2 , color = 'blue') + 
+    geom_vline(xintercept = subset(testdf, testdf$Date == "2003-04-30" & Treatment=='nt')$Date,lty=3 , color = 'blue') + 
+  ### regressions ###########
+# from the day of fertilization
+      geom_smooth(data = subset(testdf, testdf$Date >= "2003-05-15" & Date <= "2003-09-30" & Treatment =='ct'), 
+                  aes(x = Date, y = NO3, group=Treatment), 
+                se = FALSE, method = 'loess')  + 
+  
+        geom_smooth(data = subset(testdf, testdf$Date >= "2003-07-02" & Date <= "2003-09-30" & Treatment =='nt'), 
+                  aes(x = Date, y = NO3, group=Treatment), color = 'blue',
+                se = FALSE, method = 'loess')  +
+  
+        geom_smooth(data = subset(testdf, testdf$Date >= "2003-05-15" & Date <= "2003-09-30" & Treatment =='ct'), 
+                   aes(x = Date, y = NO3, group = Treatment ), color='black',
+                 se = FALSE, method = 'lm', lty=4)  + 
+  
+          geom_smooth(data = subset(testdf, testdf$Date >= "2003-07-02" & Date <= "2003-09-30" & Treatment =='nt'), 
+                   aes(x = Date, y = NO3, group = Treatment ),  color='black',
+                 se = FALSE, method = 'lm', lty=4)  + 
+  
+  # from the peak of nitrate/ammonia 
+        geom_smooth(data = subset(testdf, testdf$Date >= "2003-06-03" & Date <= "2003-09-30" & Treatment == 'ct'), 
+                  aes(x = Date, y = NO3, color = as.factor(Treatment)), 
+                se = FALSE, method = 'loess', lty = 2)  +
+        geom_smooth(data = subset(testdf, testdf$Date >= "2003-07-02" & Date <= "2003-09-30" & Treatment == 'nt'), 
+                  aes(x = Date, y = NO3), color='blue', 
+                se = FALSE, method = 'loess', lty = 2) + 
+  
+        geom_smooth(data = subset(testdf, testdf$Date >= "2003-06-03" & Date <= "2003-09-30" & Treatment == 'ct'), 
+                  aes(x = Date, y = NO3, color = as.factor(Treatment)), 
+                se = FALSE, method = 'lm', lty = 3)  +
+        geom_smooth(data = subset(testdf, testdf$Date >= "2003-07-02" & Date <= "2003-09-30" & Treatment == 'nt'), 
+                  aes(x = Date, y = NO3), color='blue', 
+                se = FALSE, method = 'lm', lty = 3)
+
+
+
+snap2 <-  ggplot(data = subset(testdf, is.na(testdf$NH4)==F),
+         aes(x = Date, y = NH4, color = as.factor(Treatment ) ) ) + # facet_wrap(~Fertilizer.Type) + 
+    geom_point() + geom_line() + theme_bw() + theme(legend.position = "top" ) + 
+  scale_x_date(limits = as.Date(c("2003-04-01","2003-11-30"))) + 
+geom_vline(xintercept = subset(testdf, is.na(testdf$Fertilizer.kgN.ha)==F & Treatment=='ct')$Date,lty=2 , color = 'red') + 
+  geom_vline(xintercept = subset(testdf, is.na(testdf$Fertilizer.kgN.ha)==F & Treatment=='nt')$Date,lty=2 , color = 'blue')
+
+grid.arrange(snap1, snap2, ncol=2)
+
+snap1b
+
+
+```             
+  \             
+  
+Notes on the figure:                
+  * The dashed vertical lines are when fertilizer was applied (160 for ct, 60 for nt)         
+  * The faint blue vertical dash is when red clover was killed at the nt site (explains why NO3 starts increasing shortly after)       
+  * The dashed lines amongst points are linear regressions from fert date, or from peak NO3.       
+  * The smoother lines are loess regressions from fert data, or from peak NO3.        
+  \        
+  
+Problems with gap-filling on soil inorganic N:          
+  * NO3 may not peak immediately after fertilization. Hard to determine what the peak would be/when it would occur.        * linear regression from fert date (black line for ct) isn't great. Would overestimate at first, but generally underestimate NO3.          
+  * Loess and linear regressions (for urea and this site-treatment case) from peak NO3 are fairly similar.        
+  \        
+  
+<span style="color: red;"> So, what options do we have for interpolation of soil inorganic N? </span>
+
+<span style="color: red;"> What about just using a continuous/constant value (the fertilizer.kgN.ha) as we know how much N was applied, and wont introduce our own error from interpolation, just provide another piece of info to the NN (how much N was applied) and see if it can infer/help with the inorganic N and time frame? </span>
+
+        
+Soil inorganic N across sites, by N application type                        
+```{r, echo=F, warning=F, message=F }
+ 
+# need to QC this 
+df2 <- data.frame( df2 %>% 
+  dplyr::group_by(SiteID, Treatment ) %>% 
+  fill(Fert.Type) ) 
+  
+# unique(subset(df2, is.na(df2$NO3)==F)[,c('SiteID','Treatment','Fert.Type')])
+
+# df2 %>% group_by(Fert.Type) %>% filter(is.na(NO3)==F) %>% tally()
+# df2 %>% group_by(Fert.Type) %>% tally()
+
+
+ggplot(data = subset(df2, is.na(df2$NO3)==F),
+         aes(x = DaysSinceApp, y = NO3, color = as.factor(id_loc ) ) ) + facet_wrap(~Fert.Type) + 
+    geom_point() + geom_line() + theme_bw() + theme(legend.position = "none" ) + 
+    geom_smooth(aes(x = DaysSinceApp, y = NO3), 
+                se = FALSE, method = 'loess')  
+ 
+ggplot(data = subset(df2, is.na(df2$NH4)==F),
+         aes(x = DaysSinceApp, y = NH4, color = as.factor(id_loc ) ) ) + facet_wrap(~Fert.Type) + 
+    geom_point() + geom_line() + theme_bw() + theme(legend.position = "none" ) + 
+    geom_smooth(aes(x = DaysSinceApp, y = NH4), # color = Fertilizer_Type 
+                se = FALSE, method = 'loess' )
+
+
+  # subset(df, is.na(df$Fertilizer.kgN.ha)==F & is.na(df$Fert.Type)==T)[,c('SiteID','Treatment','Fert.Type','Fertilizer.kgN.ha')]
+ 
+
+```          
+  \          
+
+# decay check points          
+How does NO3/NH4 decay look during the time series          
+```{r, echo=F, warning=F, message=F, eval=F  }
+
+decaydf <- df %>% 
+  filter(DaysSinceApp %in% c(1,25,50,75,100,150,200) ) 
+ 
+decaydf <- decaydf %>% 
+  group_by(SiteID,Treatment,EventNumber,DaysSinceApp) %>% 
+  mutate(NO3perc = NO3/NO3[DaysSinceApp==1] ) 
+
+datatable(decaydf)
+  
+  
+```        
+  \             
+
+# Site-treatment breakdowns           
+```{r, echo=F, warning=F, message=F }
+
+cumn2o <- df %>% 
+  dplyr::group_by(SiteID,Treatment,year) %>%
+  add_tally() %>%
+  dplyr::summarise(meanDailyn2o = mean(n2o,na.rm=T),
+                   Annn2o = sum(n2o,na.rm=T),
+                   days = length(Date), 
+                   n2ocounts = length(na.omit(n2o) ), 
+                   AnnPrecip = sum(rain, na.rm=T),
+                   tavg = mean(tavg, na.rm=T),
+                   stemp5 = mean(soil.temp5, na.rm=T), 
+                   stemp10 = mean(soil.temp10, na.rm=T), 
+                   WFPS = mean(WFPS,na.rm=T),
+                   wfps.calc = mean(wfps.calc,na.rm=T),
+                   Fertilizer.kgN.ha = sum(Fertilizer.kgN.ha,na.rm=T),
+                   n = max(n) )
+                    
+  
+datatable(cumn2o, caption = 'annual sums by site-treatment') %>% 
+  formatRound(c('meanDailyn2o','Annn2o','tavg','stemp5','stemp10','WFPS','wfps.calc'), digits=3)
+
+cumn2o2 <- cumn2o %>% 
+  dplyr::group_by(SiteID, Treatment) %>% 
+  dplyr::summarise(meanDailyn2o = mean(meanDailyn2o,na.rm=T),
+                   Annn2o = mean(Annn2o,na.rm=T),
+                    # days = length(Date), 
+                    # n2ocounts = length(na.omit(n2o) ), 
+                   AnnPrecip = mean(AnnPrecip, na.rm=T),
+                   tavg = mean(tavg, na.rm=T),
+                   stemp5 = mean(stemp5, na.rm=T), 
+                   stemp10 = mean(stemp10, na.rm=T), 
+                   WFPS = mean(WFPS,na.rm=T),
+                   wfps.calc = mean(wfps.calc,na.rm=T),
+                   n = sum(n) )
+ 
+datatable(cumn2o2, caption = 'mean across years at site-treatments') %>% 
+  formatRound(c('meanDailyn2o','Annn2o','tavg','stemp5','stemp10','WFPS','wfps.calc'), digits=3)
+ 
+  
+```            
+Need to deal with the fact that annual emissions are biased towards northern hemisphere, and the dataset is predominantly southern hemisphere.        
+  \      
+ 
+The LSTM is currently only using continuous rain and WFPS with occasional n2o provided every 5th day, with a sequence length of 30 days.            
+
+       
+```{r, echo=F}
+
+## Site overview         
+  # Summary information for the sites: 
+  
+```     
+  \      
+
+    
+# Summary statistics 
+```{r, summary stats, echo=F, warning=F, message=F }
+
+datatable(df %>% 
+  dplyr::group_by(SiteID,Treatment) %>% 
+  dplyr::summarise(n2o = round(sum(n2o, na.rm=T),3) ),
+  # for when I have NN results #           
+  # NN.est = round(sum(Yest, na.rm=T),3) ), 
+  caption = 'Cumulative Measured and LSTM estimated N2O emissions (gN2O-N/ha) ' ) 
+
+
+gt <- df %>%
+  dplyr::select(tavg,WFPS,rain.irrigation,soil.temp10,NH4,NO3,n2o) %>%
+  gather( key = "covariates", value = "value", -n2o) %>% 
+    
+ggplot(., aes(x=value, y=n2o)) +
+  stat_summary_bin(fun = "sum", geom = "bar", orientation = 'x',colour="black", fill="white" ) +
+  # geom_smooth() + geom_smooth not properly picking up the sum.... 
+facet_wrap(~ covariates, scales = 'free') 
+
+# built_lines <- ggplot_build(gt)$data[[1]]
+# names(built_lines)[2] <- 'n2o'
+# names(built_lines)[7] <- 'value'
+# names(built_lines)[7] <- 'covariates' 
+# 
+# # this will crash outside of same variables as DeRosa 
+#   # NEED to code to support variable covariates # 
+#   # 1:length(levels(as.factor( c(sort(parameters)) )))
+#   # built_lines$covariates <- ifelse(built_lines$covariates == 1, 'co2',built_lines$covariates)
+# built_lines$covariates <- ifelse(built_lines$covariates == 1, 'DaysSinceApp',built_lines$covariates)
+# built_lines$covariates <- ifelse(built_lines$covariates == 2, 'GWC',built_lines$covariates)
+# built_lines$covariates <- ifelse(built_lines$covariates == 3, 'NH4',built_lines$covariates)
+# built_lines$covariates <- ifelse(built_lines$covariates == 4, 'NO3',built_lines$covariates)
+# built_lines$covariates <- ifelse(built_lines$covariates == 5, 'sT',built_lines$covariates)
+ 
+
+  # gt <- gt + geom_smooth(data = built_lines[,c('n2o','value','covariates')], aes(x = value, y = n2o ), method = 'loess' )
+
+gt 
+
+
+```            
+  \           
+Sum of n2o by covariate bins.        
+  \       
+
+## N2O distribution 
+```{r, distro, echo=F, include = F, warning=F, message=F }
+
+# Distribution code support 
+  # https://stats.stackexchange.com/questions/132652/how-to-determine-which-distribution-fits-my-data-best
+  # https://cran.r-project.org/web/packages/fitdistrplus/vignettes/paper2JSS.pdf
+
+distroList <- data.frame(Treatment = 'test', squareSkewness = 0, kurtosis = 0 ) 
+distroList$Treatment <- as.character(distroList$Treatment)
+x=1 
+
+for(i in unique(df$Treatment)){ 
+  
+  print(i)
+  iinfo <- descdist(subset(df, df$Treatment == i & is.na(df$n2o)==F)$n2o, 
+           boot = 1000, discrete = FALSE)
+    
+  distroList[x,1] <- paste(i)
+  distroList[x,2:3] <- c(iinfo$skewness^2, iinfo$kurtosis )
+  x=x+1
+}
+
+  # calculate skew and kurtosis per site-treatment
+    # plot and put in table 
+  
+  # skewness(x, na.rm = T, type = 1)
+  # kurtosis(x, na.rm = T, type = 1)
+```         
+
+```{r, distro1b, echo=F, include = T, warning=F, message=F }
+
+distroList <- merge(distroList,cumn2o, by='Treatment', all.x=, all.y=T)
+
+# pretty much a 1:1 line. 
+  # compare to annual sum? 
+  # other...? 
+  # when would it not be 1:1....? 
+
+ggplot(data = distroList, aes(x = meanDailyn2o  , y = kurtosis, size = Fertilizer.kgN.ha ) ) + 
+  geom_point() + theme_classic()
+
+# by percent of missing n2o days.. 
+# ggplot(data = distroList, aes(x = meanDailyn2o  , y = kurtosis, size = Fertilizer.kgN.ha ) ) + 
+#   geom_point() + theme_classic()
+
+# ggplot(data = distroList, aes(x = squareSkewness, y = kurtosis) ) + 
+#  geom_point() + theme_classic()
+
+datatable(distroList, 
+          caption = 'Skew and kurtosis distribution of sites') %>%
+  formatRound(c('squareSkewness','kurtosis'), digits = 4 )
+
+```                
+  * skew - measure of the asymmetry of the probability distribution of a real-valued random variable about its mean. skewness for a normal distribution is zero, and any symmetric data should have a skewness near zero. Negative values for the skewness indicate data that are skewed left and positive values for the skewness indicate data that are skewed right.           
+  * kurtosis - measure of the "tailedness" of the probability distribution of a real-valued random variable. High kurtosis tend to have heavy tails, or outliers.                            
+[skew and kurtosis info](https://www.itl.nist.gov/div898/handbook/eda/section3/eda35b.htm)          
+  \       
+  
+```{r, distro2, echo=F, warning=F, message=F }
+  
+distro <- descdist(subset(df, is.na(df$n2o)==F)$n2o, boot = 1000, discrete = FALSE)
+ # points(x=distroList$squareSkewness, y = distroList$kurtosis, pch=16, cex=1, color = distroList$Treatment) # doesnt work 
+ 
+  par(mfrow = c(1,1))
+
+  
+
+  
+```               
+These cullen-frey graphs can be generated for all sites, but gives us an idea of what the distribution of n2o is like.        
+  \       
+
+# Covariate Distributions  
+```{r, echo=F, warning=F, message=F }
+
+  # gt <- gt + 
+    
+  outdf <- data.frame( df %>%
+  dplyr::group_by(SiteID) %>% 
+  dplyr::select(tavg,WFPS,rain.irrigation,soil.temp10,NH4,NO3,n2o,SiteID) %>%
+  gather( key = "covariates", value = "value", -SiteID) )
+  
+  
+for(i in unique(outdf$covariates)){
+  
+  if(i %in% c('rain.irrigation','n2o','NH4','NO3') ){
+ g <- ggplot(data=subset(outdf, outdf$covariates == i ), aes(x=log(value) )) + 
+    geom_histogram(aes(y = ..density..), colour="black", fill="white" ) + 
+    ggtitle(paste('log ',i, sep='')) + # theme_classic() + 
+    # facet_wrap(~ covariates, scales = "free") + 
+    geom_density(alpha=.2, fill="#FF6666") + 
+    geom_density(aes(y = ..density.., color = SiteID), alpha=.2 )
+  } else { 
+   g <- ggplot(data=subset(outdf, outdf$covariates == i ), aes(x=value)) + 
+    geom_histogram(aes(y = ..density..), colour="black", fill="white" ) + 
+    ggtitle(i) + # theme_classic() + 
+    # facet_wrap(~ covariates, scales = "free") + 
+    geom_density(alpha=.2, fill="#FF6666") + 
+    geom_density(aes(y = ..density.., color = SiteID), alpha=.2 )
+  }
+  print(g)
+  
+} 
+
+```     
+  \       
+  
+# Covariates examination            
+on raw, no gap-filling covariates (ie, NA values present in covariates)         
+```{r, cov matrix, echo = F, fig.width=18, fig.height=12 }
+
+df <- data.frame(df)
+
+M <- cor(df %>% dplyr::select(tavg,WFPS,rain.irrigation,soil.temp10,NH4,NO3,n2o,
+                              DaysSinceApp,DaysSinceTill,n2ocum,n2ocumT),  use = "pairwise.complete.obs"  )   
+  # dplyr::select_if(ttsub, is.numeric),
+
+  # potential for script crashing error if mineral N (or anything) has too few points. 
+
+corrplot.mixed(M, number.cex = 1.6, lower.col = 'black' )
+
+```      
+  \         
+ 
+basic linear gap-filled covariate examination     
+```{r, cov matrix linear gf, echo = F, fig.width=18, fig.height=12 }
+  
+
+M2 <- cor(df2 %>% dplyr::select(tavg,WFPS,rain.irrigation,soil.temp10,NH4,NO3,n2o,
+                              DaysSinceApp,DaysSinceTill,n2ocum,n2ocumT),  use = "pairwise.complete.obs"  ) 
+
+corrplot.mixed(M2, number.cex = 1.6, lower.col = 'black' )
+
+
+```     
+  \     
+
+Comparison of raw covariates to n2o (noGF) to a linear interpolated covariates comparison to n2o (GF) 
+```{r, echo = F, fig.width=10}
+
+compCov <- data.frame(noGF = round(M[,'n2o'],3), GF = round(M2[,'n2o'],3) )
+
+```                 
+Strongest covariates are: NH4, NO3, and WFPS.          
+WFPS becomes a stronger covariate upon gap-filling, while NH4 and NO3 become weaker covariates upon gap-filling.        
+  \        
+  
+# Variable importance           
+More on variable importance [here](https://topepo.github.io/caret/variable-importance.html).         
+[and here,](https://www.r-bloggers.com/2015/06/variable-importance-plot-and-variable-selection/) [and here](https://cran.r-project.org/web/packages/datarobot/vignettes/VariableImportance.html).                     
+```{r, basic var imp, echo = F, fig.width =10, eval=F}
+
+# https://www.r-bloggers.com/2015/06/variable-importance-plot-and-variable-selection/
+
+
+df2 <- data.frame( df %>%
+  group_by(SiteID,Treatment) %>%
+  mutate(NH4 = na.approx(NH4, na.rm=F),
+         NO3 = na.approx(NO3, na.rm=F), 
+         tavg = na.approx(tavg, na.rm=F),
+         soil.temp5 = na.approx(soil.temp5, na.rm=F),
+         soil.temp10 = na.approx(soil.temp10, na.rm=F),
+         WFPS = na.approx(WFPS, na.rm=F),
+         wfps.calc = na.approx(wfps.calc, na.rm=F))  )
+
+df2$WFPS <- ifelse(is.na(df2$WFPS)==T, df2$wfps.calc, df2$WFPS) 
+
+
+# set.seed(1)
+# n=500
+# library(clusterGeneration)
+# library(mnormt)
+# S=genPositiveDefMat("eigen",dim=15)
+# S=genPositiveDefMat("unifcorrmat",dim=15)
+# X=rmnorm(n,varcov=S$Sigma)
+# library(corrplot)
+# corrplot(cor(X), order = "hclust")
+# 
+# P=exp(Score)/(1+exp(Score))
+# Y=rbinom(n,size=1,prob=P)
+# df=data.frame(Y,X)
+# allX=paste("X",1:ncol(X),sep="")
+# names(df)=c("Y",allX)
+
+# require(randomForest)
+  # fit=randomForest(factor(Y)~., data=df )
+fit = randomForest(n2o ~ ., data=df2 %>% dplyr::select(soil.temp5,soil.temp10,WFPS,rain,n2o,NH4,tavg,NO3) %>% 
+                  filter(is.na(n2o)==F),
+                  importance = T, proximity = T, na.action = na.omit )
+
+
+varImp(fit)
+
+varImpPlot(fit,type=2)
+
+```       
+  \          
+  
+
+```{r,var imp, echo = F, fig.width =10, eval=F}
+
+# Basic Feedforward MLP and its variable importance test         
+
+### Neural Net
+set.seed(2020330)
+
+xmin=min(valsub$n2o, na.rm = TRUE)
+xmax=max(valsub$n2o, na.rm = TRUE)
+scalfac=xmax-xmin
+
+nn.sd = sd(valsub$n2o, na.rm=T )
+nn.mu = mean(valsub$n2o, na.rm=T )
+
+#normalize the data
+norm.df = BBmisc::normalize(data.frame(valsub), method = "range", range = c(-1,1) )
+
+   summary(valsub$n2o)
+   summary(norm.df$n2o)
+     
+#store the normalized gap data
+  unk = filter(norm.df, is.na(n2o)==F)
+
+#clean up the data frame to remove any NAs
+norm.df=filter(norm.df, !is.na(n2o) )
+
+#store the number of variables
+nvar=ncol(norm.df %>% dplyr::select(-Date,-count) )
+
+#store grouping variable and then remove
+  #season=train_scaled$season
+  #train_scaled=train_scaled[,c(1:nvar-1) ]
+  # norm.df=norm.df[,c(2:nvar) ] # 
+norm.df=norm.df[,c(1:nvar-1) ]
+
+#store the number of variables
+nvar=ncol(norm.df)
+
+#create the ANN formula
+predictors <- names(norm.df)
+form_nn <- as.formula(paste('n2o~', paste(predictors[!predictors %in% c('n2o','Date','count','season')], collapse= '+')))
+
+rmse_fold=c(replicate(10,0))
+folds=data.frame(rmse_fold)
+avg_rmse=c(replicate(10,0))
+seed=c(replicate(10,0))
+nets=data.frame(avg_rmse, seed)
+node=c(replicate((nvar-2),0))
+best_rmse=c(replicate((nvar-2),0))
+best_seed=c(replicate((nvar-2),0))
+bestnet=data.frame(node, best_rmse, best_seed)
+
+#kfold cross-validation (grouped by season)
+    # k-fold partitioning of a data set for model testing purposes. Each record is randomly assigned to a group, Group numbers are between 1 and k. 
+    # not sure we want to include 'season' anymore... 
+  # set.seed(1)
+groups = kfold(norm.df, k=10 ) # , by=season)
+
+for (i in 2:(nvar-1)){
+  
+ for (j in 1:10){ 
+  set.seed(j)
+  
+  w=matrix(data = runif(nvar*i+i+1, min = -1/sqrt(nvar-1), max = 1/sqrt(nvar-1)), nrow   =nvar*i+i+1 , ncol = 1)
+   w[1]=0
+    for (r in 1:i){
+    
+    w[1+r*nvar]=0
+    }
+
+      for (k in 1:10){
+        nn.valid=norm.df[groups==k,]
+        nn.validtarget=norm.df[groups==k, nvar]
+        nn.training=norm.df[groups!=k,]
+        
+         nn=neuralnet(form_nn, data=norm.df, 
+        hidden = i, threshold=0.05, rep = 1, startweights = w, act.fct = "tanh",               
+        linear.output = F)
+        
+        pred=predict(nn, nn.valid)
+        folds$rmse_fold[k]=Metrics::rmse(nn.validtarget, pred)
+      }
+   
+ nets$avg_rmse[j]=mean(folds[,"rmse_fold"])
+ nets$seed[j]=j
+ }
+  
+bestnet$node[i-1]=i
+bestnet$best_rmse[i-1]=nets$avg_rmse[which.min(nets$avg_rmse)]
+bestnet$best_seed[i-1]=nets$seed[which.min(nets$avg_rmse)]
+}
+
+plot(bestnet$node, bestnet$best_rmse, xlab="Hidden Nodes",ylab="Average RMSE")
+  # shows the best model structure to use  
+
+#store the best parameters
+i=bestnet$node[which.min(bestnet$best_rmse)]
+s=bestnet$best_seed[which.min(bestnet$best_rmse)]
+
+
+## Train the best model and predict 
+
+#split the data
+nn.training <- norm.df[index, 1:nvar]   # norm.df[ind==1, 1:nvar]
+nn.test <- norm.df[-index, 1:nvar]       # norm.df[ind==2, 1:nvar]
+
+#split the N2O data
+  nn.testtarget <- norm.df[-index, 'n2o']
+
+#train the best net
+set.seed(s)
+
+# set initial weights ..
+w=matrix(data = runif(nvar*i+i+1, min = -1/sqrt(nvar-1), max = 1/sqrt(nvar-1)), nrow   =nvar*i+i+1 , ncol = 1)  # dim: 25,1
+w[1]=0
+
+  for (r in 1:i){
+          
+  w[1+r*nvar]=0
+  }
+
+
+
+# basic feedforward MLP structure 
+nn = neuralnet(form_nn, data = nn.training, 
+               hidden = i, startweights = w, 
+               threshold = .001, stepmax = 1e+08,
+               rep = 1, linear.output = F,   
+               act.fct = "tanh" )
+
+
+## variable importance 
+garson(nn)
+
+
+```       
+  \          
+  
+Variable importance from Random Forest test - using raw (no gap-filling data set):           
+```{r, RF import, echo = F, fig.width =10, eval=F}
+
+
+
+# Estimate significance of importance metrics for a Random Forest model by permuting the response variable. Produces null distribution of importance metrics for each predictor variable and p-value of observed
+  # response variable is then permuted nrep times, with a new Random Forest model built for each permutation step.
+
+# had to remove tavg
+
+n2o.rfP <- rfPermute(n2o ~ ., 
+                data = df %>% dplyr::select(soil.temp5,soil.temp10,WFPS,rain,n2o),
+  # data = df %>% dplyr::select(-Date,-SiteID,-Treatment,-rain.irrigation,
+         #                            -Fert.Type,-Fertilizer.kgN.ha,-Tillage.type,-Tillage.cm), 
+  na.action = na.omit, nrep = 50, num.cores = 1, ntree = 500 )   # 
+
+
+# Plot the null distributions and observed values.
+
+  # vertical red line shows importance score
+  # p-value in facet label 
+# plotNull(n2o.rfP) 
+  
+# https://stats.stackexchange.com/questions/12605/measures-of-variable-importance-in-random-forests
+
+# MSE 
+  # increase in mse of predictions(estimated with out-of-bag-CV) as a result of variable j being permuted(values randomly shuffled). 
+  
+# IncNodePurity relates to the loss function which by best splits are chosen
+    # IncNodePurity is biased and should only be used if the extra computation time of calculating %IncMSE is unacceptable
+
+# Plot the unscaled importance distributions and highlight significant predictors
+plot(rp.importance(n2o.rfP, scale = FALSE),main='unscaled')
+  
+# ... and the scaled measures
+plot(rp.importance(n2o.rfP, scale = TRUE),main='scaled')
+
+
+# Extract a matrix of the observed importance scores and p-values from the object produced by a call to rfPermute
+n2oRF <- rp.importance(n2o.rfP, scale = TRUE  )
+n2oRF
+
+  # rf.significance(newn2oRF) 
+
+########## 
+
+```       
+  \          
+  
+Variable importance from Random Forest using basic linear gap-filling on all covariates:      
+  * excluded missing n2o values.       
+```{r, RF import gf, echo = F, fig.width =10, eval=F}
+
+# library(rfPermute)
+
+# summary(df2)
+
+# tavg is proving problematic in the RF model ...  
+# NH4 and NO3 as well.... 
+  # removed soil.temp5 
+  # lots of WFPS missing... 
+
+# Estimate significance of importance metrics for a Random Forest model by permuting the response variable. Produces null distribution of importance metrics for each predictor variable and p-value of observed
+  # response variable is then permuted nrep times, with a new Random Forest model built for each permutation step.
+n2o.rfP <- rfPermute(n2o ~ ., 
+                data = df2 %>% dplyr::select(tavg,soil.temp10,WFPS,rain,n2o,NH4,NO3) %>% 
+                  filter(is.na(n2o)==F ), # & is.na(NH4)==F),
+  # data = df %>% dplyr::select(-Date,-SiteID,-Treatment,-rain.irrigation,
+         #                            -Fert.Type,-Fertilizer.kgN.ha,-Tillage.type,-Tillage.cm), 
+  # keep.forest = T, importance = T, 
+  na.action = na.omit, importance = T, proximity = T )
+  # nrep = 50, num.cores = 1, ntree = 500 )   # 
+
+
+# Plot the null distributions and observed values.
+
+  # vertical red line shows importance score
+  # p-value in facet label 
+# plotNull(n2o.rfP) 
+  
+# https://stats.stackexchange.com/questions/12605/measures-of-variable-importance-in-random-forests
+
+# MSE 
+  # increase in mse of predictions(estimated with out-of-bag-CV) as a result of variable j being permuted(values randomly shuffled). 
+  
+# IncNodePurity relates to the loss function which by best splits are chosen
+    # IncNodePurity is biased and should only be used if the extra computation time of calculating %IncMSE is unacceptable
+
+# Plot the unscaled importance distributions and highlight significant predictors
+plot(rp.importance(n2o.rfP, scale = FALSE), main='unscaled')
+  
+# ... and the scaled measures
+plot(rp.importance(n2o.rfP, scale = TRUE),main='scaled')
+
+
+# Extract a matrix of the observed importance scores and p-values from the object produced by a call to rfPermute
+n2oRF <- rp.importance(n2o.rfP, scale = TRUE  )
+n2oRF
+
+  # rf.significance(newn2oRF) 
+
+########## 
+
+```       
+  \          
+    
+```{r, cov results comp, echo = F, fig.width =10, eval=F}
+
+CovResults <- data.frame(variable=character(),t=numeric(), df=numeric(), pvalue=numeric(), 
+                         cor=numeric(),LCI=numeric(),UCI=numeric(), stringsAsFactors = F )
+x=1
+checkcols <- gsub("n2o","",names(df %>% dplyr::select(tavg,WFPS,rain.irrigation,soil.temp10,NH4,NO3,n2o)))
+checkcols <- checkcols[checkcols != ""]
+
+for(cova in checkcols ){ 
+  
+  corsum <- cor.test(as.formula(paste("~n2o +", paste0(cova), sep='') ), na.action = "na.exclude", data = df)
+  CovResults[x,] <- c(cova,corsum$statistic[[1]],corsum$parameter[[1]],corsum$p.value, 
+                      corsum$estimate[[1]],corsum$conf.int[1], corsum$conf.int[2])
+  
+  x=x+1
+}
+
+CovResults$cor <- as.numeric(CovResults$cor)
+CovResults$LCI <- as.numeric(CovResults$LCI)
+CovResults$UCI <- as.numeric(CovResults$UCI)
+
+
+# ## gap filling covariates ## 
+# # set seed
+set.seed(2019814)
+# 
+# need to fill in with same values that the NN is using # 
+  out.eg <- df %>% dplyr::select(tavg,WFPS,rain.irrigation,soil.temp10,NH4,NO3,n2o) # Yest
+  
+    # this chunk of code is slow/crashes things ..... 
+  out.eg <- na_ma(out.eg, k = 3, weighting = "linear" )
+  # where k is the moving window size. Filling in NA data with linear interpolation #
+  
+  
+  out.eg2 <- out.eg
+  # out.eg <- out.eg %>% dplyr::select(-Yest)
+  out.eg2 <- out.eg2 %>% dplyr::select(-n2o)
+
+  x=1
+#checkcols <- gsub("n2o","",names(dplyr::select_if(out.eg, is.numeric)))
+#checkcols <- checkcols[checkcols != ""]
+
+CovResults2 <- data.frame(variable=character(),t=numeric(), df=numeric(), pvalue=numeric(),
+                         cor=numeric(),LCI=numeric(),UCI=numeric(), stringsAsFactors = F )
+
+for(cova in checkcols ){
+
+  corsum <- cor.test(as.formula(paste("~n2o +", paste0(cova), sep='') ), na.action = "na.exclude", data = out.eg)
+  CovResults2[x,] <- c(cova,corsum$statistic[[1]],corsum$parameter[[1]],corsum$p.value,
+                      corsum$estimate[[1]],corsum$conf.int[1], corsum$conf.int[2])
+
+  x=x+1
+}
+
+CovResults2$cor <- as.numeric(CovResults2$cor)
+CovResults2$LCI <- as.numeric(CovResults2$LCI)
+CovResults2$UCI <- as.numeric(CovResults2$UCI)
+CovResults2$filled <- "filled values"
+CovResults$filled <- "raw values"
+
+CovResults <- rbind(CovResults, CovResults2)
+
+ # for the NN estimate 
+CovResults3 <- data.frame(variable=character(),t=numeric(), df=numeric(), pvalue=numeric(),
+                         cor=numeric(),LCI=numeric(),UCI=numeric(), stringsAsFactors = F )
+x=1
+for(cova in checkcols ){
+
+  corsum <- cor.test(as.formula(paste("~Yest +", paste0(cova), sep='') ), na.action = "na.exclude", data = out.eg2)
+  CovResults3[x,] <- c(cova,corsum$statistic[[1]],corsum$parameter[[1]],corsum$p.value,
+                      corsum$estimate[[1]],corsum$conf.int[1], corsum$conf.int[2])
+
+  x=x+1
+}
+
+CovResults3$cor <- as.numeric(CovResults3$cor)
+CovResults3$LCI <- as.numeric(CovResults3$LCI)
+CovResults3$UCI <- as.numeric(CovResults3$UCI)
+CovResults3$filled <- "NN values"
+
+
+CovResults <- rbind(CovResults, CovResults3)
+
+
+## covariate plot 
+ggplot(data = CovResults,
+       aes(x=variable,  color=filled, y=cor, middle=cor, ymin = LCI, ymax = UCI, lower=LCI, upper = UCI )) +   # 
+  
+  geom_boxplot(stat='identity', size=2 ) + 
+  geom_text(data=subset(CovResults,CovResults$filled=='raw values'), aes(x=variable, y=UCI * 1.25, label=df ), color='red', size=8 ) +
+  theme_bw() + 
+  ggtitle('Covariate correlation to n2o \n the number on the plot represents # observed data points ') +
+  theme(axis.text = element_text(size = 22), plot.title = element_text(size = 24),
+        axis.title = element_text(size = 22, face = "bold") )
+
+# just what is in NN currently 
+ggplot(data = CovResults %>% filter(variable %in% c('WFPS','rain.irrigation') ),
+       aes(x=variable,  color=filled, y=cor, middle=cor, ymin = LCI, ymax = UCI, lower=LCI, upper = UCI )) +   # 
+  
+  geom_boxplot(stat='identity', size=2 ) + 
+  geom_text(data=subset(CovResults,CovResults$filled=='raw values')%>% filter(variable %in% c('WFPS','rain.irrigation') ), aes(x=variable, y=UCI * 1.25, label=df ), color='red', size=8 ) +
+  theme_bw() + 
+  ggtitle('Covariate correlation to n2o \n the number on the plot represents # observed data points ') +
+  theme(axis.text = element_text(size = 22), plot.title = element_text(size = 24),
+        axis.title = element_text(size = 22, face = "bold") )
+
+
+
+```     
+  \         
+            
+            
+# Train-test-holdout data splits   
+```{r, data splits, echo = F, fig.width =10, warning=F}
+
+
+ggplot(data = df2, aes(x = soil.temp5, y = soil.temp10) ) + 
+  geom_point() + theme_bw() + 
+  geom_abline(slope = 1, intercept = 0, color='red') + 
+  annotate("text", x = -5, y=30, label="a few sites with soil.temp5 and no soil.temp10 \n how does 1:1 compare at other sites")
+
+# remove datasets with  a lot of missing WFPS 
+df2 <- subset(df2, ! df2$Treatment %in% 
+                subset(missingVariableCompletely, missingVariableCompletely$percentWFPSdata < 40  )$Treatment  )
+
+# remove datasets with a lot of missing soil.temp10 (keep those with good soil.temp5) 
+df2 <- subset(df2, ! df2$Treatment %in% 
+                subset(missingVariableCompletely, missingVariableCompletely$percentSTdata < 40 & percentST5data <40  )$Treatment  )
+
+  # exclude the forest data set #    
+df2 <- subset(df2, df2$Treatment != 'spruce' )
+
+
+# unique site-treatments that we have to work with 
+  # unique(df2[,c('SiteID','Treatment','Sand','Silt','Clay')])
+
+  
+  cumn2o2 <- subset(cumn2o2, cumn2o2$Treatment %in% df2$Treatment ) 
+  
+  cumn2o2 <- cumn2o2[,c('SiteID','Treatment','n','Annn2o','meanDailyn2o','AnnPrecip','stemp10','WFPS','stemp5','tavg')]
+  
+datatable(cumn2o2, caption = 'site-treatment summary breakdown') %>% 
+  formatRound(c('meanDailyn2o','Annn2o','tavg','stemp5','stemp10','WFPS'), digits=3)
+
+ 
+   nrow(unique(df2[,c('SiteID','Treatment')]) ) # number of unique site-treatments # 
+nrow(unique(cumn2o2[,c('SiteID','Treatment')]) ) # number of unique site-treatments # 
+
+names(df2)[18] <- "rainirrigation"
+
+  # stratification for building training-testing-holdout datasets #   
+    # not doing any stratifying rn
+   holdout <- subset(df2, df2$Treatment %in% c("Ma+CONV","Till_pasture","grass.0n","50n") )
+
+   write.csv(holdout, row.names = F,
+          "C:/n2o_nn/LSTM_June2022/GlobalN2ODB_NN_HOLDOUT_datasets.csv" ) 
+   
+    df2 <- subset(df2, ! df2$Treatment %in% c("Ma+CONV","Till_pasture","grass.0n","50n") )
+    
+write.csv(df2, row.names = F,
+          "C:/n2o_nn/LSTM_June2022/GlobalN2ODB_NN_cleaned_dataset.csv" )   
+
+
+
+   
+write.csv(cumn2o2, row.names = F,
+          "C:/n2o_nn/LSTM_June2022/GlobalN2ODB_NN_dataset.csv" )   
+
+```       
+  
+# Cross validation training             
+Rotating holdout datasets for a single model.         
+```{r, rotating holdout, echo = F, fig.width =10, warning=F, eval=F}
+
+# https://stackoverflow.com/questions/37149649/randomly-sample-groups
+
+df2 <- rbind(df2,holdout)
+
+  dim(unique(df2[,c('SiteID','Treatment')]))
+    # 73,2
+  
+sample_n_of <- function(data, size, ...) {
+  dots <- quos(...)
+  
+  group_ids <- data %>% 
+    group_by(!!! dots) %>% 
+    group_indices()
+  
+  sampled_groups <- sample(unique(group_ids), size)
+  
+  data %>% 
+    filter(group_ids %in% sampled_groups)
+}
+
+df2$rain.irrigation <- ifelse(is.na(df2$rain.irrigation)==T,df2$rain,df2$rain.irrigation)
+df2$soil.temp10 <- ifelse(is.na(df2$soil.temp10)==T,df2$soil.temp5,df2$soil.temp10)
+df2$WFPS <- ifelse(is.na(df2$WFPS)==T,df2$wfps.calc,df2$WFPS)
+ 
+df2$rain.irrigation <- ifelse(is.na(df2$rain.irrigation)==T,0,df2$rain.irrigation)
+  
+df3 <- df2[,c('SiteID','Treatment','Date',
+              'Fertilizer.kgN.ha', 'Fert.Type',
+              'rain', 'rain.irrigation',
+              'soil.temp10','soil.temp5','WFPS','wfps.calc',
+              'NH4', 'NO3',
+              'n2o','n2osd',
+              'wfps.real', 'NH4.real', 'NO3.real', 'tavg.real', 'soil.temp5.real', 'soil.temp10.real')]
+
+df3$n2o.real <- 1
+
+df3 <- data.frame( df3 %>%
+  group_by(SiteID,Treatment) %>%
+  mutate(NH4 = na.approx(NH4, na.rm=F),
+         NO3 = na.approx(NO3, na.rm=F),
+         soil.temp10 = na.approx(soil.temp10, na.rm=F),
+         WFPS = na.approx(WFPS, na.rm=F),
+         
+        n2o = na.approx(n2o, na.rm=F) ) )
+
+df3$Treatment <- ifelse(df3$Treatment == 't1' & df3$SiteID == 'kelly.52','t1_kelly.52',df3$Treatment )
+df3$Treatment <- ifelse(df3$Treatment == 't1' & df3$SiteID == 'kelly.38','t1_kelly.38',df3$Treatment )
+
+df3$Treatment <- ifelse(df3$Treatment == 't2' & df3$SiteID == 'kelly.52','t2_kelly.52',df3$Treatment )
+df3$Treatment <- ifelse(df3$Treatment == 't2' & df3$SiteID == 'kelly.38','t2_kelly.38',df3$Treatment )
+
+df3$Treatment <- ifelse(df3$Treatment == 't3' & df3$SiteID == 'kelly.52','t3_kelly.52',df3$Treatment )
+df3$Treatment <- ifelse(df3$Treatment == 't3' & df3$SiteID == 'kelly.38','t3_kelly.38',df3$Treatment )
+df3$Treatment <- ifelse(df3$Treatment == 't3' & df3$SiteID == 'kelly.24.27','t3_kelly.24.27',df3$Treatment )
+
+df3$Treatment <- ifelse(df3$Treatment == 't4' & df3$SiteID == 'kelly.52','t4_kelly.52',df3$Treatment )
+df3$Treatment <- ifelse(df3$Treatment == 't4' & df3$SiteID == 'kelly.38','t4_kelly.38',df3$Treatment )
+df3$Treatment <- ifelse(df3$Treatment == 't3' & df3$SiteID == 'kelly.24.27','t4_kelly.24.27',df3$Treatment )
+
+dim(unique(df2[,c('SiteID','Treatment')]))
+
+usedholdouts <- c() 
+
+for(i in 1:18){ 
+  
+  print(i)
+  
+  holdout <- df3 %>% 
+    sample_n_of(size = 4, Treatment)
+  
+  holdout <- subset(holdout, ! holdout$Treatment %in% usedholdouts )
+  
+  while(length(unique(holdout$Treatment)) != 4 ){
+    
+    holdout <- df3 %>% 
+    sample_n_of(size = 4, Treatment)
+  
+   holdout <- subset(holdout, ! holdout$Treatment %in% usedholdouts )
+  
+  } 
+  print( unique(holdout$Treatment) )
+   
+  usedholdouts <- c(usedholdouts,unique(holdout$Treatment) )
+  
+  maindf <- df3 %>% filter(! Treatment %in% holdout$Treatment )
+  
+  write.csv(holdout, row.names = F,
+            file = paste("N:/Research/conant/chris/Dorich_n2o/n2o_nn/N2O_NN/RotatingHoldout_test/holdout_", i,".csv", sep='') )
+  write.csv(maindf, row.names = F,
+            file = paste("N:/Research/conant/chris/Dorich_n2o/n2o_nn/N2O_NN/RotatingHoldout_test/traintest_", i,".csv",  sep='') )
+  
+}
+
+
+
+```       
+  \           
