@@ -75,7 +75,7 @@ for i = 1:length(sites)
     
     data = rawtab((rawtab.SiteID == sitename) & (rawtab.Treatment == treatment),:);
     
-    data.rainirrigation = str2double(data.rainirrigation);
+ %   data.rainirrigation = str2double(data.rainirrigation);
 
     % we have NaN values for all covariates in a lot of these datasets
     % after a certain point. Were drawn out to 365 days...? 
